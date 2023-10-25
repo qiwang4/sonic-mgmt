@@ -766,3 +766,77 @@ def test_nhop_group_member_order_capability(duthost, tbinfo, ptfadapter, gather_
     for flow_count, nexthop_selected in recvd_pkt_result.items():
         pytest_assert(nexthop_map[flow_count] in nexthop_selected,
                       "Flow {} is not picking expected Neighbor".format(flow_count))
+
+def test_nhop_group_empty_first(duthost, tbinfo, ptfadapter, gather_facts):
+    """
+    Test an empty next hop group add to a route first, then group members up,
+    check route works fine in this case. Steps:
+    - Add test IP address to an active IP interface
+    - Add IP route and nexthop
+    - Add static ARPs
+    - clean up
+    - Verify no errors and crash
+    """
+    # Set of parameters for Cisco-8000 devices
+    if is_cisco_device(duthost):
+        default_max_nhop_paths = 2
+        polling_interval = 1
+        sleep_time = 380
+        sleep_time_sync_before = 120
+    elif is_innovium_device(duthost):
+        default_max_nhop_paths = 3
+        polling_interval = 10
+        sleep_time = 120
+    elif is_mellanox_device(duthost) and get_chip_type(duthost) == 'spectrum1':
+        default_max_nhop_paths = 8
+        polling_interval = 10
+        sleep_time = 120
+    else:
+        default_max_nhop_paths = 32
+        polling_interval = 10
+        sleep_time = 120
+    nhop_group_limit = 1024
+    # program more than the advertised limit
+    extra_nhops = 10
+
+    asic = duthost.asic_instance()
+
+    # find out an active IP port
+    ip_ifaces = list(asic.get_active_ip_interfaces(tbinfo).keys())
+    pytest_assert(len(ip_ifaces), "No IP interfaces found")
+    eth_if = ip_ifaces[0]
+
+    # Generate ARP entries
+    arplist = Arp(duthost, asic, default_max_nhop_paths, eth_if)
+
+    ip_prefix = ipaddr.IPAddress("192.168.0.0")
+
+    # create nexthop group
+    nhop = IPRoutes(duthost, asic)
+
+    # get a list of unique group of next hop IPs
+    ips = [arplist.ip_mac_list[x].ip for x in indx_list]
+    ip_route = "{}/31".format(ip_prefix + (2*i))
+
+    # add IP route with the next hop group created
+    nhop.add_ip_route(ip_route, ips)
+
+    nhop.program_routes()
+    # wait for routes to be synced and programmed
+    time.sleep(sleep_time)
+
+    # Apply ARP entries
+    arplist.arps_add()
+
+    recvd_pkt_result = defaultdict(set)
+    rtr_mac = asic.get_router_mac()
+
+    ip_ttl = 121
+    flow_count = 10
+
+    pkt, exp_pkt = build_pkt(rtr_mac, ip_route, ip_ttl, flow_count)
+    testutils.send(ptfadapter, gather_facts['dst_port_ids'][0], pkt, 1000)
+    recv_pkt_cnt = testutils.count_matched_packets(test=ptfadapter, pkt=exp_pkt,
+                                                   ports=gather_facts['src_port_ids'])
+
+    pytest_assert((recv_pkt_cnt == 1000), "Received packet cnt not match sent num")
